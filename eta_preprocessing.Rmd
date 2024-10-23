@@ -1,0 +1,657 @@
+---
+title: "Pre-processing"
+author: 'Team ETA'
+date: "2024-01-22"
+output: pdf_document
+---
+
+```{r, include=F}
+
+library(tidyverse)
+library(ggplot2)
+library(ggcorrplot)
+library(jsonlite)
+library(imputeTS)
+library(forecast)
+library(Amelia)
+library(broom)
+library(stats)
+library(TSstudio)
+library(plotly)
+library(zoo)
+library(tseries)
+library(forecast)
+
+```
+
+
+###########################################################
+##################       SETTINGS         #################
+###########################################################
+
+- PROCESS_TRAINING_DATA: Flag to indicate whether to pre-process and export the training data or the testing data. A value of TRUE will process the training data, FALSE will process the test data. In an ideal world, both would be processed in sequence.
+
+- ENABLE_HOTFIX_001: The selected training/test split (data_test - Transaction_date >= "2022-07-01", data_train - Transaction_date < "2022-07-01") results in stores 8051 and 3446 having sales within the SubSect_PackSize category "ISB - BAGUETTES (Pack)" for the training split but none in the test split which upsets Amelia, the imputation library. This resolves this by altering the sequence on an ad-hoc basis. This will be applied regardless of whether it is the training or test export to ensure the models can be correctly evaluated and is justified as follows: if the stores didn't sell a single one of these products, they likely don't sell it and therefore are not concerned with how many to bake. N.B: This may not be necessary if a different split is selected, hence the option to apply or not. 
+
+```{r}
+
+# PROCESS TRAINING OR TESTING:
+PROCESS_TRAINING_DATA <- TRUE
+
+# APPLY HOTFIX 001: 
+ENABLE_HOTFIX_001 <- TRUE
+
+## DO NOT MODIFY
+file_export_label <- "data_training.csv"
+
+if (!PROCESS_TRAINING_DATA) {
+  file_export_label <-"data_testing.csv"
+}
+
+```
+
+
+# Overview
+
+-   split the data into test and train sets
+-   Cast Transaction_date to correct data type
+-   Converted Weather_Rain to a binary value
+-   Filtered the data set to only include the following stores:
+    -   5751- Heysham
+    -   5147- Heysham Middleton
+    -   8051- Emsgate Lane silver dale
+    -   3446- Petrol three peaks
+-   Grouped by Store_Number, Transaction_date, SubSect_Description
+-   Added Bins: Weather_Feels_Like_Bin, Weather_Cloud_Bin
+-   Added Operating Hours based on Opening and Closing. This doesn't help if earlier/later opening times have an impact but its a start.
+-   Added Total Quantity of Sales (Full Price + Reduced Price)
+-   Check for zero sales and for any NA's - NONE Found.
+-   Data Imputation: - Deleted all rows falling between the 2nd and 19th December
+-   Merge Tiger Rolls into one product: Product code for Co-op Tiger Baton PMP 200G changed to Co-op Tiger Bread PMP 400G
+-   Create lag features, -7days -1 day, -2 days, weather -1 day, weather - 2 days
+-   Create Feature subsect+pack size
+-   Capture distribution of bread per SubSect_PackSize and create final data frame
+
+## Load the data and cast the date to the correct data type. We are also going to change the weather rain, as it is currently categorical (0, 1, 2, 3). We will assume 0 is no rain and anything else is rain (1)
+```{r}
+
+setwd("./data/")
+data <- read.csv("LU Grp project data - Co-op ISB forecasting.csv")
+
+# observe the data types
+# str(data)
+
+# number of the one hot encoded vars have been parsed as int and products are char so we will convert some vars to factors
+
+#create vector of column to convert to factor
+names <- c('MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY','MIDWEEK','WEEKEND','BH_FLAG','SPRING','SUMMER','AUTUMN','Product_Code','Store_Name','Product_Description','SubSect_Description')
+
+### convert cols to factor
+data[,names] <- lapply(data[,names] , factor)
+
+### convert trans_date to date as currently a char
+data$Transaction_date = ymd(data$Transaction_date)
+
+
+#max(coop_data$Transaction_date) last date of the data is 31/8/22 so we will split the dataset into test and train
+# we will train on all the data upto 30/06/22 with july/august 22 being the test set. roughly 12%
+data_test_raw <- data %>% filter(Transaction_date >= "2022-07-01")
+data_train <- data %>% filter(Transaction_date < "2022-07-01")
+
+# Swap the dataset if we are looking at the test dataset
+if (!PROCESS_TRAINING_DATA) {
+  data_train <- data_test_raw
+}
+
+
+### convert rain to binary factor
+data_train <- data_train %>% mutate(Weather_Rain = as.factor(ifelse(Weather_Rain > 0, 1, 0))) 
+  
+#check for NAs
+which(is.na(data_train), arr.ind=TRUE)
+#No NAs in the df which is good
+
+# check for no sales
+data_train %>% filter(Full_Price_Sales_Quantity <1 & Reduced_To_Clear_Quantity <1)
+#No rows where sales of full price and reduced items are less than 1
+
+# check for full price sales = 0 and if full price sales <0
+nrow(data_train %>% filter(Full_Price_Sales_Quantity ==0))
+# 2663 rows of zero full price sales!
+nrow(data_train %>% filter(Full_Price_Sales_Quantity <0))
+# 3 rows where full prices sales <0 
+
+### delete the 3 rows as sales can't be negative
+data_train <- data_train %>% filter(Full_Price_Sales_Quantity >=0)
+
+```
+
+# Create Feature subsect+pack size
+```{r}
+
+# Let's get the distinct values for Product Descriptions and SubSect_Descriptions
+distinct_product_descriptions <- data_train %>%
+  ungroup() %>%
+  select(Product_Description) %>%
+  distinct()
+
+distinct_subsect_descriptions <- data_train %>%
+  ungroup() %>%
+  select(SubSect_Description) %>%
+  distinct()
+
+# Let's create new descriptions based on what the product description contains. Looking at distinct_product_descriptions they are all single unless 4S or 4Pack are in the description, and so we just test for that
+data_train <- data_train %>%
+  mutate(
+    SubSect_PackSize = case_when(
+      str_detect(Product_Description, "4S|4PACK") ~ str_c(SubSect_Description, " (Pack)"),
+      TRUE ~ str_c(SubSect_Description, " (Single)")
+    )
+  )
+
+data_train$SubSect_PackSize <- factor(data_train$SubSect_PackSize)
+data_train$Store_Number <- as.numeric(data_train$Store_Number)
+
+# Let's have a look at the results. Good.
+SubSect_PackSize_Check <- data_train %>%
+  ungroup() %>%
+  select(Product_Description, SubSect_Description, SubSect_PackSize) %>%
+  distinct()
+
+# We now have 6 distinct SubSect_PackSize options.
+distinct_subsect_pack_descriptions <- data_train %>%
+  ungroup() %>%
+  select(SubSect_PackSize) %>%
+  distinct()
+
+```
+
+# Data Imputation
+```{r}
+
+# we will need to create a couple of Dfs
+
+# base with all the possible date, and combinations of products
+# weather for each day
+# day features
+# sales vol for day and prod
+
+data_train_a <- data_train %>%
+  select(Store_Number,Transaction_date,SubSect_PackSize, 
+         Full_Price_Sales_Quantity, Reduced_To_Clear_Quantity) %>%
+  #filter(Store_Number %in% c(3446,5147,5751,8051)) %>%
+  arrange(Store_Number,SubSect_PackSize,Transaction_date) %>%
+  group_by(across(-c(Full_Price_Sales_Quantity,Reduced_To_Clear_Quantity))) %>%
+  summarise(Full_Price_Sales_Quantity =  sum(Full_Price_Sales_Quantity)
+            ) %>%
+  as.data.frame()
+
+
+# create variables of complete dates, stores and prod_pack
+dates = seq(as.Date(min(data_train$Transaction_date)), as.Date(max(data_train_a$Transaction_date)),by= "day")
+prods = unique(data_train$SubSect_PackSize)
+stores = unique(data_train$Store_Number)
+
+# make a dataframe of all the possible dates, products by store
+all_dates <- expand_grid(dates,prods,stores)
+all_date <- all_dates %>% filter(dates != "2021-12-25")
+
+# create weather df
+weather <- data_train %>% distinct(Transaction_date, Weather_Feels_Like,Weather_Rain,Weather_Cloud)
+
+#create date related df
+date_features <- data_train %>% distinct(Transaction_date,BH_FLAG,MONDAY,TUESDAY,WEDNESDAY,THURSDAY,FRIDAY,SATURDAY,SPRING,SUMMER,AUTUMN)
+
+# join dfs in a list
+df_list <- list(all_dates, weather, date_features)
+
+# Merge dataframes with left join
+df_merged <- reduce(df_list, left_join,by= c("dates"= "Transaction_date"))
+
+### filter to the stores we wish to forecast
+df_merged <- df_merged %>% filter(stores %in% c(3446,5147,5751,8051))
+
+
+### join the df_merged on the sales volumes
+
+data_train_final <- left_join( df_merged ,data_train_a, 
+                                    by = c("dates"= "Transaction_date" , "stores" = "Store_Number", "prods" = "SubSect_PackSize"))
+
+
+######## now that we have out df of complete sales NA where we have missing we need to impute the values
+
+# we will use Amelia package, which uses Rubin's rule here 
+#https://doi.org/10.1002/9780470316696
+
+# uses regression to predict missing values based on backwards and sideways computation, we thus need to pivot our df to wide
+
+
+
+##### cant pass multiple stores toth e impude function for some reasone CS parameter wont work with the store number
+
+# setting the minimum imputed val as 0 to prevent negative values from being predicted
+bounds = do.call(rbind, list( c(16,0, Inf), c(17,0, Inf), c(18,0, Inf), c(19,0, Inf), c(20,0, Inf), c(21,0, Inf)))
+
+##########################################################################################################
+
+data_wide_5147 <- data_train_final %>% 
+  arrange(stores,prods,dates) %>% filter (stores == 5147) %>%
+  pivot_wider(
+    names_from = prods, values_from = Full_Price_Sales_Quantity
+  ) %>% as.data.frame()
+
+
+imputed_data_5147 <- amelia(data_wide_5147,
+                            bounds = bounds ,
+                            m = 5, 
+                            ts = "dates", 
+                            polytime = 1,
+                            #cs = "stores", #doesnt seem to like stores as a split!
+                            idvars = c("stores","BH_FLAG", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SPRING", "SUMMER", "AUTUMN","Weather_Cloud","Weather_Rain"), 
+                            lags = c("Weather_Feels_Like"))
+
+#########################################################################################################
+
+data_wide_3446 <- data_train_final %>% 
+  arrange(stores,prods,dates) %>% filter (stores == 3446) %>%
+  pivot_wider(
+    names_from = prods, values_from = Full_Price_Sales_Quantity
+  ) %>% as.data.frame()
+
+
+# TEST SPLIT ONLY "Amelia" is not happy. Store 3446 has no value for ISB - BAGUETTES (Pack) in the testing split, perhaps they stopped selling it. With no values, Amelia can't impute it. 
+bounds_3446 = do.call(rbind, list( c(16,0, Inf), c(17,0, Inf), c(18,0, Inf), c(19,0, Inf), c(20,0, Inf), c(21,0, Inf)))
+
+if (ENABLE_HOTFIX_001) {
+  bounds_3446 = do.call(rbind, list( c(16,0, Inf), c(17,0, Inf), c(18,0, Inf), c(19,0, Inf), c(20,0, Inf)))
+  data_wide_3446 <- data_wide_3446[ , !(names(data_wide_3446) %in% "ISB - BAGUETTES (Pack)")]
+}
+
+imputed_data_3446 <- amelia(data_wide_3446,
+                            bounds = bounds_3446,
+                            m = 5, 
+                            ts = "dates", 
+                            polytime = 1,
+                            #cs = "stores", #doesnt seem to like stores as a split!
+                            idvars = c("stores","BH_FLAG", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SPRING", "SUMMER", "AUTUMN","Weather_Cloud","Weather_Rain"), 
+                            lags = c("Weather_Feels_Like"))
+
+#########################################################################################################
+data_wide_5751 <- data_train_final %>% 
+  arrange(stores,prods,dates) %>% filter (stores == 5751) %>%
+  pivot_wider(
+    names_from = prods, values_from = Full_Price_Sales_Quantity
+  ) %>% as.data.frame()
+
+
+
+
+imputed_data_5751 <- amelia(data_wide_5751,
+                            bounds = bounds ,
+                            m = 5, 
+                            ts = "dates", 
+                            polytime = 1,
+                            #cs = "stores", #doesnt seem to like stores as a split!
+                            idvars = c("stores","BH_FLAG", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SPRING", "SUMMER", "AUTUMN","Weather_Cloud","Weather_Rain"), 
+                            lags = c("Weather_Feels_Like"))
+
+
+
+#########################################################################################################
+data_wide_8051 <- data_train_final %>% 
+  arrange(stores,prods,dates) %>% filter (stores == 8051) %>%
+  pivot_wider(
+    names_from = prods, values_from = Full_Price_Sales_Quantity
+  ) %>% as.data.frame()
+
+# TEST SPLIT ONLY "Amelia" is not happy. Store 3446 has no value for ISB - BAGUETTES (Pack) in the testing split, perhaps they stopped selling it. With no values, Amelia can't impute it. 
+bounds_8051 = do.call(rbind, list( c(16,0, Inf), c(17,0, Inf), c(18,0, Inf), c(19,0, Inf), c(20,0, Inf), c(21,0, Inf)))
+
+if (ENABLE_HOTFIX_001) {
+  bounds_8051 = do.call(rbind, list( c(16,0, Inf), c(17,0, Inf), c(18,0, Inf), c(19,0, Inf), c(20,0, Inf)))
+  data_wide_8051 <- data_wide_8051[ , !(names(data_wide_8051) %in% "ISB - BAGUETTES (Pack)")]
+}
+
+imputed_data_8051 <- amelia(data_wide_8051,
+                            bounds = bounds_8051,
+                            m = 5, 
+                            ts = "dates", 
+                            polytime = 1,
+                            #cs = "stores", #doesnt seem to like stores as a split!
+                            idvars = c("stores","BH_FLAG", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SPRING", "SUMMER", "AUTUMN","Weather_Cloud","Weather_Rain"), 
+                            lags = c("Weather_Feels_Like"))
+
+
+
+#########################################################################################################
+
+
+```
+
+# next merge all the imputed values back into the df
+```{r}
+
+ all_imputs_5147 <- bind_rows(unclass(imputed_data_5147$imputations), .id = "m") %>%
+   group_by(m) %>%
+   nest()
+ 
+ all_imputs_3446 <- bind_rows(unclass(imputed_data_3446$imputations), .id = "m") %>%
+   group_by(m) %>%
+   nest()
+
+ all_imputs_5751 <- bind_rows(unclass(imputed_data_5751$imputations), .id = "m") %>%
+   group_by(m) %>%
+   nest()
+ 
+ all_imputs_8051 <- bind_rows(unclass(imputed_data_8051$imputations), .id = "m") %>%
+   group_by(m) %>%
+   nest()
+ 
+categories <- c("ISB - ROLL (Pack)", "ISB - WMEAL LOAVES (Single)", "ISB - ROLL (Single)",
+                "ISB - BAGUETTES (Single)", "ISB - WHITE LOAVES (Single)", 
+                "ISB - BAGUETTES (Pack)")
+ 
+store <- c(5147,3446,5751,8051)
+
+```
+
+```{r}
+
+# unpacking the imputed values and calculating the avg value across the 5 samples
+
+df_1 <- cbind.data.frame(all_imputs_5147$data[[1]]$stores,all_imputs_5147$data[[1]]$dates,all_imputs_5147$data[[1]]$`ISB - BAGUETTES (Pack)`,all_imputs_5147$data[[2]]$`ISB - BAGUETTES (Pack)`,all_imputs_5147$data[[3]]$`ISB - BAGUETTES (Pack)`,all_imputs_5147$data[[4]]$`ISB - BAGUETTES (Pack)`,all_imputs_5147$data[[5]]$`ISB - BAGUETTES (Pack)`,all_imputs_5147$data[[1]]$`ISB - BAGUETTES (Single)`,all_imputs_5147$data[[2]]$`ISB - BAGUETTES (Single)`,all_imputs_5147$data[[3]]$`ISB - BAGUETTES (Single)`,all_imputs_5147$data[[4]]$`ISB - BAGUETTES (Single)`,all_imputs_5147$data[[4]]$`ISB - BAGUETTES (Single)` ,all_imputs_5147$data[[1]]$`ISB - ROLL (Pack)`,all_imputs_5147$data[[2]]$`ISB - ROLL (Pack)`,all_imputs_5147$data[[3]]$`ISB - ROLL (Pack)`,all_imputs_5147$data[[4]]$`ISB - ROLL (Pack)`,all_imputs_5147$data[[5]]$`ISB - ROLL (Pack)`,all_imputs_5147$data[[1]]$`ISB - ROLL (Single)`,all_imputs_5147$data[[2]]$`ISB - ROLL (Single)`,all_imputs_5147$data[[3]]$`ISB - ROLL (Single)`,all_imputs_5147$data[[4]]$`ISB - ROLL (Single)`,all_imputs_5147$data[[5]]$`ISB - ROLL (Single)`,all_imputs_5147$data[[1]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5147$data[[2]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5147$data[[3]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5147$data[[4]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5147$data[[5]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5147$data[[1]]$`ISB - WMEAL LOAVES (Single)`,all_imputs_5147$data[[2]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_5147$data[[3]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_5147$data[[4]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_5147$data[[5]]$`ISB - WMEAL LOAVES (Single)`)
+  
+# Test split had no data for ISB - BAGUETTES (Pack) for store 3446, so it was removed prior to impute.
+if (ENABLE_HOTFIX_001) {
+  df_2 <-cbind.data.frame(all_imputs_3446$data[[1]]$stores,all_imputs_3446$data[[1]]$dates,all_imputs_3446$data[[1]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[2]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[3]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[4]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[4]]$`ISB - BAGUETTES (Single)` ,all_imputs_3446$data[[1]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[2]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[3]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[4]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[5]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[1]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[2]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[3]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[4]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[5]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[1]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[2]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[3]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[4]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[5]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[1]]$`ISB - WMEAL LOAVES (Single)`,all_imputs_3446$data[[2]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_3446$data[[3]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_3446$data[[4]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_3446$data[[5]]$`ISB - WMEAL LOAVES (Single)`)
+} else {
+  df_2 <-cbind.data.frame(all_imputs_3446$data[[1]]$stores,all_imputs_3446$data[[1]]$dates,all_imputs_3446$data[[1]]$`ISB - BAGUETTES (Pack)`,all_imputs_3446$data[[2]]$`ISB - BAGUETTES (Pack)`,all_imputs_3446$data[[3]]$`ISB - BAGUETTES (Pack)`,all_imputs_3446$data[[4]]$`ISB - BAGUETTES (Pack)`,all_imputs_3446$data[[5]]$`ISB - BAGUETTES (Pack)`,all_imputs_3446$data[[1]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[2]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[3]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[4]]$`ISB - BAGUETTES (Single)`,all_imputs_3446$data[[4]]$`ISB - BAGUETTES (Single)` ,all_imputs_3446$data[[1]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[2]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[3]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[4]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[5]]$`ISB - ROLL (Pack)`,all_imputs_3446$data[[1]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[2]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[3]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[4]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[5]]$`ISB - ROLL (Single)`,all_imputs_3446$data[[1]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[2]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[3]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[4]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[5]]$`ISB - WHITE LOAVES (Single)`,all_imputs_3446$data[[1]]$`ISB - WMEAL LOAVES (Single)`,all_imputs_3446$data[[2]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_3446$data[[3]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_3446$data[[4]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_3446$data[[5]]$`ISB - WMEAL LOAVES (Single)`)
+}
+
+df_3 <-cbind.data.frame(all_imputs_5751$data[[1]]$stores,all_imputs_5751$data[[1]]$dates,all_imputs_5751$data[[1]]$`ISB - BAGUETTES (Pack)`,all_imputs_5751$data[[2]]$`ISB - BAGUETTES (Pack)`,all_imputs_5751$data[[3]]$`ISB - BAGUETTES (Pack)`,all_imputs_5751$data[[4]]$`ISB - BAGUETTES (Pack)`,all_imputs_5751$data[[5]]$`ISB - BAGUETTES (Pack)`,all_imputs_5751$data[[1]]$`ISB - BAGUETTES (Single)`,all_imputs_5751$data[[2]]$`ISB - BAGUETTES (Single)`,all_imputs_5751$data[[3]]$`ISB - BAGUETTES (Single)`,all_imputs_5751$data[[4]]$`ISB - BAGUETTES (Single)`,all_imputs_5751$data[[4]]$`ISB - BAGUETTES (Single)` ,all_imputs_5751$data[[1]]$`ISB - ROLL (Pack)`,all_imputs_5751$data[[2]]$`ISB - ROLL (Pack)`,all_imputs_5751$data[[3]]$`ISB - ROLL (Pack)`,all_imputs_5751$data[[4]]$`ISB - ROLL (Pack)`,all_imputs_5751$data[[5]]$`ISB - ROLL (Pack)`,all_imputs_5751$data[[1]]$`ISB - ROLL (Single)`,all_imputs_5751$data[[2]]$`ISB - ROLL (Single)`,all_imputs_5751$data[[3]]$`ISB - ROLL (Single)`,all_imputs_5751$data[[4]]$`ISB - ROLL (Single)`,all_imputs_5751$data[[5]]$`ISB - ROLL (Single)`,all_imputs_5751$data[[1]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5751$data[[2]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5751$data[[3]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5751$data[[4]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5751$data[[5]]$`ISB - WHITE LOAVES (Single)`,all_imputs_5751$data[[1]]$`ISB - WMEAL LOAVES (Single)`,all_imputs_5751$data[[2]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_5751$data[[3]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_5751$data[[4]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_5751$data[[5]]$`ISB - WMEAL LOAVES (Single)`)
+
+# Test split had no data for ISB - BAGUETTES (Pack) for store 8051, so it was removed prior to impute.
+if (ENABLE_HOTFIX_001) {
+  df_4 <-cbind.data.frame(all_imputs_8051$data[[1]]$stores,all_imputs_8051$data[[1]]$dates,all_imputs_8051$data[[1]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[2]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[3]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[4]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[4]]$`ISB - BAGUETTES (Single)` ,all_imputs_8051$data[[1]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[2]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[3]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[4]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[5]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[1]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[2]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[3]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[4]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[5]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[1]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[2]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[3]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[4]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[5]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[1]]$`ISB - WMEAL LOAVES (Single)`,all_imputs_8051$data[[2]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_8051$data[[3]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_8051$data[[4]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_8051$data[[5]]$`ISB - WMEAL LOAVES (Single)`)
+} else {
+  df_4 <-cbind.data.frame(all_imputs_8051$data[[1]]$stores,all_imputs_8051$data[[1]]$dates,all_imputs_8051$data[[1]]$`ISB - BAGUETTES (Pack)`,all_imputs_8051$data[[2]]$`ISB - BAGUETTES (Pack)`,all_imputs_8051$data[[3]]$`ISB - BAGUETTES (Pack)`,all_imputs_8051$data[[4]]$`ISB - BAGUETTES (Pack)`,all_imputs_8051$data[[5]]$`ISB - BAGUETTES (Pack)`,all_imputs_8051$data[[1]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[2]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[3]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[4]]$`ISB - BAGUETTES (Single)`,all_imputs_8051$data[[4]]$`ISB - BAGUETTES (Single)` ,all_imputs_8051$data[[1]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[2]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[3]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[4]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[5]]$`ISB - ROLL (Pack)`,all_imputs_8051$data[[1]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[2]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[3]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[4]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[5]]$`ISB - ROLL (Single)`,all_imputs_8051$data[[1]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[2]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[3]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[4]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[5]]$`ISB - WHITE LOAVES (Single)`,all_imputs_8051$data[[1]]$`ISB - WMEAL LOAVES (Single)`,all_imputs_8051$data[[2]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_8051$data[[3]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_8051$data[[4]]$`ISB - WMEAL LOAVES (Single)` ,all_imputs_8051$data[[5]]$`ISB - WMEAL LOAVES (Single)`)
+}
+
+imputed_vals <- data.frame(Map(c,df_1,df_2,df_3,df_4))
+
+if (ENABLE_HOTFIX_001) {
+  # calculate the mean values
+  imputed_vals <- imputed_vals %>%
+     rowwise() %>% 
+    mutate(BAGUETTES_Single_imp = mean(c_across(3:7)),
+           ROLL_Pack_imp = mean(c_across(8:12)),
+           ROLL_Single_imp = mean(c_across(13:17)),
+           WHITE_LOAVES_Single_imp = mean(c_across(18:22)),
+           WMEAL_LOAVES_Single_imp = mean(c_across(23:27))
+           ) %>%
+    
+    select (1,2,
+           BAGUETTES_Single_imp,
+           ROLL_Pack_imp,
+           ROLL_Single_imp,
+           WHITE_LOAVES_Single_imp,
+           WMEAL_LOAVES_Single_imp) %>% as.data.frame() %>% rename(stores=1,dates = 2)
+} else {
+  # calculate the mean values
+  imputed_vals <- imputed_vals %>%
+     rowwise() %>% 
+    mutate(BAGUETTES_Pack_imp = mean(c_across(3:7)),
+           BAGUETTES_Single_imp = mean(c_across(8:12)),
+           ROLL_Pack_imp = mean(c_across(13:17)),
+           ROLL_Single_imp = mean(c_across(18:22)),
+           WHITE_LOAVES_Single_imp = mean(c_across(23:27)),
+           WMEAL_LOAVES_Single_imp = mean(c_across(28:32)),
+           ) %>%
+    
+    select (1,2,BAGUETTES_Pack_imp,
+           BAGUETTES_Single_imp,
+           ROLL_Pack_imp,
+           ROLL_Single_imp,
+           WHITE_LOAVES_Single_imp,
+           WMEAL_LOAVES_Single_imp) %>% as.data.frame() %>% rename(stores=1,dates = 2)
+}
+
+```
+
+```{r}
+
+# If we are processing the test split, we now need to add these back in so we can rbind with matching number of columns.
+if (ENABLE_HOTFIX_001) {
+  data_wide_3446 <- data_wide_3446 %>% 
+    mutate(
+      "ISB - BAGUETTES (Pack)" = NA
+    )
+  
+  data_wide_8051 <- data_wide_8051 %>% 
+    mutate(
+      "ISB - BAGUETTES (Pack)" = NA
+    )
+}
+
+# merge the imputed values back into the train data
+data_wide_train <- rbind(data_wide_5147,data_wide_3446,data_wide_5751,data_wide_8051)
+ 
+data_wide_train  <- left_join( data_wide_train  ,imputed_vals, 
+                                    by = c("dates"= "dates" , "stores" = "stores"))
+
+############################################## final data set to train ################################
+
+if (ENABLE_HOTFIX_001) {
+  data_train_ready <- data_wide_train %>% select (-c(16:20)) %>%
+  pivot_longer(cols = c(16:21), names_to = "SubSect_PackSize", values_to = "quantity_sold_imp" )
+} else {
+data_train_ready <- data_wide_train %>% select (-c(16:21)) %>%
+  pivot_longer(cols = c(16:21), names_to = "SubSect_PackSize", values_to = "quantity_sold_imp" )
+}
+
+```
+
+
+## Add Weather Bins
+```{r}
+
+# Calculate the mean and standard deviation of Weather_Feels_Like and Weather_Cloud
+mean_feels_like <- mean(data_train_ready$Weather_Feels_Like, na.rm = TRUE)
+sd_feels_like <- sd(data_train_ready$Weather_Feels_Like, na.rm = TRUE)
+mean_weather_cloud <- mean(data_train_ready$Weather_Cloud, na.rm = TRUE)
+sd_weather_cloud <- sd(data_train_ready$Weather_Cloud, na.rm = TRUE)
+
+data_train_ready <- data_train_ready %>%
+  mutate(
+    Weather_Feels_Like_Bin = case_when(
+      Weather_Feels_Like < mean_feels_like - 3 * sd_feels_like ~ -3, # < -3SD
+      Weather_Feels_Like < mean_feels_like - 2 * sd_feels_like ~ -2, # -3SD to -2SD
+      Weather_Feels_Like < mean_feels_like - sd_feels_like ~ -1,     # -2SD to -1SD
+      Weather_Feels_Like < mean_feels_like + sd_feels_like ~ 0,      # -1SD to +1SD
+      Weather_Feels_Like < mean_feels_like + 2 * sd_feels_like ~ 1,  # +1SD to +2SD
+      Weather_Feels_Like < mean_feels_like + 3 * sd_feels_like ~ 2,  # +2SD to +3SD 
+      TRUE ~ 3 # > +3SD
+    ),
+    Weather_Cloud_Bin = case_when(
+      Weather_Cloud < mean_weather_cloud - 3 * sd_weather_cloud ~ -3, # < -3SD
+      Weather_Cloud < mean_weather_cloud - 2 * sd_weather_cloud ~ -2, # -3SD to -2SD
+      Weather_Cloud < mean_weather_cloud - sd_weather_cloud ~ -1,     # -2SD to -1SD
+      Weather_Cloud < mean_weather_cloud + sd_weather_cloud ~ 0,      # -1SD to +1SD
+      Weather_Cloud < mean_weather_cloud + 2 * sd_weather_cloud ~ 1,  # +1SD to +2SD
+      Weather_Cloud < mean_weather_cloud + 3 * sd_weather_cloud ~ 2,  # +2SD to +3SD 
+      TRUE ~ 3 # > +3SD
+    ))
+
+```
+
+# Create lag features, -7days -1 day, -2 days, weather -1 day, weather - 2 days
+```{r}
+
+# Create the lag features using the lag() function
+data_train_ready <- data_train_ready %>%
+  arrange(stores, SubSect_PackSize, dates) %>%
+  group_by(stores,SubSect_PackSize) %>%
+  mutate(
+    Lag1_Weather_Feels_Like_Bin = lag(Weather_Feels_Like_Bin, 1),
+    Lag2_Weather_Feels_Like_Bin = lag(Weather_Feels_Like_Bin, 2),
+    Lag1_Weather_Cloud_Bin = lag(Weather_Cloud_Bin, 1),
+    Lag2_Weather_Cloud_Bin = lag(Weather_Cloud_Bin, 2),
+    Lag1_Weather_Rain = lag(Weather_Rain, 1),
+    Lag2_Weather_Rain = lag(Weather_Rain, 2),
+    Lag1_Quantity = lag(quantity_sold_imp, 1),
+    Lag2_Quantity = lag(quantity_sold_imp, 2),
+    Lag7_Quantity = lag(quantity_sold_imp, 7),
+    Lag28_Quantity = lag(quantity_sold_imp,28),
+    Lag1_BH = lag(BH_FLAG,1),
+    Lag2_BH = lag(BH_FLAG,2),
+    Lead4_BH = lead(BH_FLAG,4),
+    Lead3_BH = lead(BH_FLAG,3),
+    Lead2_BH = lead(BH_FLAG,2),
+    Lead1_BH = lead(BH_FLAG,1)
+  )
+
+```
+
+# This just calls for another Correlation matrix right??
+```{r}
+
+# Let's gather our values together, doing this to reorder and rename from lag_features for the matrix
+# lag_correlation <- data.frame(
+#   Temp = lag_features$Weather_Feels_Like_Bin,
+#   Temp_L1 = lag_features$L1_Weather_Feels_Like_Bin,
+#   Temp_L2 = lag_features$L2_Weather_Feels_Like_Bin,
+#   Rain = lag_features$Weather_Rain,
+#   Rain_L1 = lag_features$L1_Weather_Rain,
+#   Rain_L2 = lag_features$L2_Weather_Rain,
+#   Cloud = lag_features$Weather_Cloud_Bin,
+#   Cloud_L1 = lag_features$L1_Weather_Cloud_Bin,
+#   Cloud_L2 = lag_features$L2_Weather_Cloud_Bin,
+#   Sales = lag_features$Total_Quantity,
+#   Sales_L1 = lag_features$L1_Total_Quantity,
+#   Sales_L2 = lag_features$L2_Total_Quantity,
+#   Sales_L7 = lag_features$L7_Total_Quantity
+# )
+# 
+# # It doesn't like the logical NA's created on lag features without enough previous rows to calculate, so: use = "complete.obs"
+# lag_corr_matrix <- cor(lag_correlation, use = "complete.obs")
+# 
+# ggcorrplot(lag_corr_matrix,
+#            type = "lower",
+#            colors = c("blue", "white", "red"),
+#            title = "Weather and Total Sales With Lag Features",
+#            lab = FALSE)
+
+```
+
+# Capture distribution of bread per SubSect_PackSize
+```{r}
+
+# Note: This is really a bit messy... fancy optimising? Go for it. 
+
+# Get the daily sales per store per product per store including all of our predictor variables - Note that the old lag features for sales quantities are not important now as we are looking at things by SubSect_PackSize
+
+#################### USED IN THE REPORT FOR THE DISTRIBUTION TABLE ################
+###################################################################################
+
+dist <- data_train %>% 
+  mutate( day_of_week = weekdays(Transaction_date)) %>%
+  group_by(Store_Number, day_of_week, SubSect_PackSize,Product_Description ) %>%
+  arrange(Store_Number,day_of_week, SubSect_PackSize,Product_Description) %>%
+  summarize(
+    Daily_Sales = sum(Full_Price_Sales_Quantity),
+    Num_days = n_distinct(Transaction_date)
+    #num_day = unique(Transaction_date)
+    
+  ) %>% 
+  group_by(Store_Number, day_of_week,SubSect_PackSize) %>%
+  mutate(prop = Daily_Sales / sum(Daily_Sales))
+
+
+# We have our final dataframe
+head(data_train_ready)
+head(dist)
+```
+
+# Export the data
+```{r}
+
+# Export raw (unprocessed) testing data and the processed data, it's either training or testing depending on the flag in the settings
+write.csv(data_train_ready, file_export_label)
+
+# These are not currently used
+# write.csv(data_test_raw, "data_testing_raw.csv")
+# write.csv(dist, "product_distribution.csv")
+
+```
+
+# In report: Additional Data Analysis (i.e. seasonal decomposition)
+```{r}
+
+# create dataset
+ts_5147 <- data_train_ready %>% filter(stores == 5147 & SubSect_PackSize == "ROLL_Single_imp") %>% select(dates,quantity_sold_imp)
+
+#set start date for ts
+start_date <- min(ts_5147$dates)
+
+# create ts monthly 
+daily_sales_ts <- ts(ts_5147$quantity_sold_imp ,start=c(1,wday(start_date)),
+                     frequency = 30)
+
+# create ts weekly - this ones and subsiquent associated code ie daily_sales_ts_wk ones are for the report
+daily_sales_ts_wk <- ts(ts_5147$quantity_sold_imp ,start=c(1,wday(start_date)),
+                     frequency = 7)
+# summary
+#ts_info(daily_sales_ts )
+
+#plot
+#plot.ts(daily_sales_ts)
+plot.ts(daily_sales_ts_wk)
+
+#test for stationary - DICKEY FULLER TEST
+#adf.test(daily_sales_ts)
+adf.test(daily_sales_ts_wk)
+
+# plot the residuals and view ACF
+forecast::checkresiduals(daily_sales_ts_wk)
+
+itsmr::test(daily_sales_ts_wk)
+
+# test for stationary 
+kpss.test(daily_sales_ts_wk)
+
+```
+
+# Plot seasonal decomposition
+```{r}
+
+#plot(decompose(daily_sales_ts))
+
+# this is the one used in the report
+plot(decompose(daily_sales_ts_wk))
+
+# moving average plots
+ts_ma(ts.obj = daily_sales_ts_wk,
+ n = c(2,5),# Setting an order 5 and 11 moving average
+ n_left = 6, n_right = 5, # Setting an order 12 moving average
+ plot = TRUE,multiple = TRUE, margin = 0.04)
+
+#acf(daily_sales_ts)
+#pacf(daily_sales_ts)
+
+# view acf and pacf plots
+acf(daily_sales_ts_wk)
+pacf(daily_sales_ts_wk)
+
+```
+
+```{r}
+
+mod <- auto.arima(daily_sales_ts_wk)
+mod
+
+forecast::checkresiduals(mod)
+summary(mod)
+
+```
+
+

@@ -1,0 +1,606 @@
+---
+title: "modelling"
+author: '36661502'
+date: "2024-01-26"
+output: pdf_document
+---
+
+# Load Libraries
+```{r, include=F}
+
+library(tidyverse)
+library(glmnet)
+library(forecast)
+library(dplyr)
+library(ggplot2)
+library(smooth)
+
+```
+
+# Load Data
+```{r}
+
+setwd("./data/")
+training_data <- read.csv("data_training.csv")
+testing_data <- read.csv("data_testing.csv")
+
+```
+
+# What are we working with - Training and Testing are the same
+```{r}
+
+colnames(training_data)
+
+```
+
+# Our separators 
+```{r}
+
+# distinct_stores <- training_data %>%
+#   ungroup() %>%
+#   select(stores) %>%
+#   distinct()
+# 
+# distinct_categories <- training_data %>%
+#   ungroup() %>%
+#   select(SubSect_PackSize) %>%
+#   distinct()
+
+stores <- c(3446, 5147, 5751, 8051)
+subsects <- c("BAGUETTES_Single_imp", "ISB - WMEAL LOAVES (Single)", 
+              "ROLL_Pack_imp", "ROLL_Single_imp", "WHITE_LOAVES_Single_imp", 
+              "WMEAL_LOAVES_Single_imp")
+```
+
+# Additional pre-processing
+```{r}
+
+# Get rid of any row containing NA's - primarily from lag features in the first few dates.
+training_data <- na.omit(training_data)
+testing_data <- na.omit(testing_data)
+
+# Convert Transaction_date (dates) to Date format
+training_data$dates <- ymd(training_data$dates)
+testing_data$dates <- ymd(testing_data$dates)
+
+```
+
+# LASSO Modelling
+```{r}
+# Reproducability
+set.seed(1)
+
+# We will run a model for each store (4), and for each store, a model for each susbsect (6), resulting in 24 models. The results will be stored in a list for further analysis
+lasso_results <- list()
+
+# Loop through store
+for (store in stores) {
+  
+  # For each store, loop through the subsects
+  for (subsect in subsects) {
+    
+    # Filter both data sets based on store and subsect
+    training_data_filtered <- training_data %>%
+      filter(stores == store, SubSect_PackSize == subsect)
+    
+    testing_data_filtered <- testing_data %>%
+      filter(stores == store, SubSect_PackSize == subsect)
+    
+    # Select Explanatory variables
+    model_vars <- quantity_sold_imp ~ Weather_Feels_Like + 
+      Weather_Rain + Weather_Cloud + BH_FLAG + MONDAY + TUESDAY +
+      WEDNESDAY + THURSDAY + FRIDAY + SATURDAY + SPRING + SUMMER +
+      AUTUMN + Weather_Feels_Like_Bin + Weather_Cloud_Bin + 
+      Lag1_Weather_Feels_Like_Bin + Lag2_Weather_Feels_Like_Bin + 
+      Lag1_Weather_Cloud_Bin + Lag2_Weather_Cloud_Bin + 
+      Lag1_Weather_Rain + Lag2_Weather_Rain + Lag1_Quantity +
+      Lag2_Quantity + Lag7_Quantity + Lag28_Quantity +
+      Lag1_BH + Lag2_BH + Lead4_BH + Lead3_BH + Lead2_BH +
+      Lead1_BH
+    
+    # Prepare the matrix
+    x_train <- model.matrix(model_vars, data = training_data_filtered)
+    y_train <- training_data_filtered$quantity_sold_imp
+    
+    x_test <- model.matrix(model_vars, data = testing_data_filtered)
+    y_test <- testing_data_filtered$quantity_sold_imp
+    
+    # Fit the LASSO model
+    lasso_model <- glmnet(x_train, y_train, alpha = 1)
+    
+    # Cross-validation to find the best lambda
+    cv_model <- cv.glmnet(x_train, y_train, alpha = 1)
+    best_lambda <- cv_model$lambda.min
+    
+    # Fit the model again but with the best lambda
+    best_lasso_model <- glmnet(x_train, y_train, alpha = 1, lambda = best_lambda)
+    
+    # Predictions on the test set
+    predictions <- predict(best_lasso_model, s = best_lambda, newx = x_test)
+    
+    # Calculate MSE, RMSE and MAE
+    MSE <- mean((testing_data_filtered$quantity_sold_imp - predictions)^2)
+    RMSE <- sqrt(MSE)
+    MAE <- mean(abs(testing_data_filtered$quantity_sold_imp - predictions))
+    
+    # Extract coefficients for the best lambda
+    best_lambda_coefficients <- coef(best_lasso_model, s = best_lambda)
+    
+    # Convert to a matrix and then a data frame
+    coefficients_matrix <- as.matrix(best_lambda_coefficients)
+    coefficients_df <- data.frame(
+      Feature = rownames(coefficients_matrix),
+      Coefficient = coefficients_matrix[, 1]
+    )
+    
+    # Remove all of the zeros (non-significant/reduced coefficients)
+    coefficients_df_filtered <- coefficients_df %>%
+      filter(coefficients_df$Coefficient != 0)
+    
+    # Create a list to contain our results for this iteration
+    store_subsect_results <- list(
+      Store = store,
+      Subsect = subsect,
+      Coefficients = coefficients_df_filtered,
+      MSE = MSE,
+      RMSE = RMSE,
+      MAE = MAE
+    )
+
+    # Unique identifier for this iteration
+    identifier <- paste("store", store, "subsect", subsect, sep = "_")
+
+    # Append the results to the main list
+    lasso_results[[identifier]] <- store_subsect_results
+  }
+}
+```
+
+# Analyse the results of LASSO
+```{r}
+
+# Get all of the coefficients
+all_coefficients <- lasso_results %>%
+  bind_rows(.id = "id") %>%
+  select(-id) %>%
+  unnest(Coefficients)
+
+# Summarise the results
+coefficient_summary <- all_coefficients %>%
+  group_by(Feature) %>%
+  summarize(
+    Frequency = n(),
+    Coefficient_Mean = mean(Coefficient),
+    MSE_Mean = mean(MSE),
+    RMSE_Mean = mean(RMSE),
+    MAE_Mean = mean(MAE),
+  ) %>%
+  ungroup() %>%
+  arrange(desc(Frequency))
+
+print(coefficient_summary)
+
+# Let's pick our explanatory variables? This could be improved, I have just picked all of the variables that have a frequency of 13 or more, which is more than half of the 24 models.
+explanatory_variables <- c("Lag1_Quantity", "BH_FLAG", "Lag2_Quantity", 
+                           "Lag7_Quantity", "SATURDAY", "AUTUMN", 
+                           "Lead1_BH", "Lead2_BH", "THURSDAY", 
+                           "TUESDAY", "Lag1_BH", "FRIDAY", 
+                           "Lag28_Quantity", "SPRING", "Weather_Feels_Like_Bin")
+
+# We need a few more variables though
+additional_variables <- c("dates", "stores", "SubSect_PackSize", "quantity_sold_imp")
+all_variables <- c(additional_variables, explanatory_variables)
+
+# Filter both data sets based on the new explanatory variables
+training_data_final <- training_data %>%
+  select(one_of(all_variables))
+
+testing_data_final <- testing_data %>%
+  select(one_of(all_variables))
+```
+
+# Exponential Smoothing (ES) and Simple Moving Average (SMA)
+```{r}
+# We will run both models for each subsect, so 12 models.
+es_sma_results <- list()
+
+# For each subsect process the ES and SMA models
+for (subsect in subsects) {
+  
+  # NOTE: We are only looking at store 5751 (Heysham) due to time constraints and data completeness.
+  store_number = 5751
+  
+  # Filter the training data 
+  training_data_filtered <- training_data %>%
+    filter(stores == store_number, 
+           SubSect_PackSize == subsect)
+  
+  testing_data_filtered <- testing_data %>%
+    filter(stores == store_number, 
+           SubSect_PackSize == subsect)
+  
+  # I tried to use a frequency of 365 to capture seasonality, but ets/forecast() does not support frequencies greater than 24. I then used stlf, but only have 387 days of data (train) and need double the frequency. Dropped frequency to ignore seasonality.
+  
+  # Create a time-series object
+  time_series_training <- ts(training_data_filtered$quantity_sold_imp)
+  
+  # Get the number of rows in the testing data, this will be the number of predictions we want to make to compare
+  prediction_count <- nrow(testing_data_filtered)
+  
+  # Fit the Exponential Smoothing Model and forecast the values
+  es_fit <- ets(time_series_training)
+  es_forecasted_values <- forecast(es_fit, h = prediction_count)
+  
+  # Calculate Mean Squared Error (MSE) and Mean Absolute Error (MAE)
+  es_actual_values <- testing_data_filtered$quantity_sold_imp
+  ES_MSE <- mean((es_actual_values - es_forecasted_values$mean)^2)
+  ES_MAE <- mean(abs(es_actual_values - es_forecasted_values$mean))
+  
+  # SMA
+  sma_result <- sma(time_series_training)
+  sma_forecasted_values <- sma_result$forecast
+  
+  # This method doesn't produce a lengthy set of predictions, making it shorter than the test set. We can still check the MSE and MAE for the limited set of predictions by matching the size of the test data.
+  sma_num_forecasts <- length(sma_forecasted_values)
+  sma_testing_data <- head(testing_data_filtered, sma_num_forecasts)
+  
+  # Calculate Mean Squared Error (MSE) and Mean Absolute Error (MAE)
+  sma_actual_values <- sma_testing_data$quantity_sold_imp
+  SMA_MSE <- mean((sma_actual_values - sma_forecasted_values)^2)
+  SMA_MAE <- mean(abs(sma_actual_values - sma_forecasted_values))
+  
+  # Combine results into a single list
+  results <- list(
+    Store = store_number,
+    Subsect = subsect,
+    ES_Forecast = es_forecasted_values,
+    ES_MSE = ES_MSE,
+    ES_MAE = ES_MAE,
+    SMA_Forecast = sma_forecasted_values,
+    SMA_MSE = SMA_MSE,
+    SMA_MAE = SMA_MAE
+  )
+  
+  identifier <- paste("store", store_number, "subsect", subsect, sep = "_")
+  es_sma_results[[identifier]] <- results
+}
+
+```
+
+# MAE/MSE Analysis
+```{r}
+
+# Get the MAE and MSE results for all models limiting the lasso results to store 5751 for comparability. 
+es_sma_analysis <- map_df(es_sma_results, ~data.frame(
+  Store = .x$Store,
+  Subsect = .x$Subsect,
+  Model = c("ES", "SMA"),
+  MAE = c(.x$ES_MAE, .x$SMA_MAE),
+  MSE = c(.x$ES_MSE, .x$SMA_MSE),
+  stringsAsFactors = FALSE
+))
+
+lasso_analysis <- lasso_results %>%
+  map_df(~data.frame(
+    Store = .x$Store,
+    Subsect = .x$Subsect,
+    MSE = .x$MSE,
+    MAE = .x$MAE
+  ), .id = "Identifier") %>%
+  select(-Identifier) %>%
+  filter(Store == 5751) # Comment this to compare with other stores
+
+lasso_analysis <- lasso_analysis %>%
+  mutate(Model = "LASSO")
+
+lasso_es_sma_results <- bind_rows(lasso_analysis, es_sma_analysis) %>%
+  arrange(Subsect)
+
+lasso_es_sma_results <- lasso_es_sma_results %>% mutate(RMSE = sqrt(MSE))
+
+print(lasso_es_sma_results)
+
+```
+
+# ARIMA - Regular
+```{r}
+#Defining subsects
+subsects <- c("BAGUETTES_Single_imp", "ISB - WMEAL LOAVES (Single)", 
+              "ROLL_Pack_imp", "ROLL_Single_imp", "WHITE_LOAVES_Single_imp", 
+              "WMEAL_LOAVES_Single_imp")
+
+#Creating the lists for each of the error metrics
+RMSEs <- c()
+MEs <- c()
+MAEs <- c()
+
+#We iterate over each of the subsects
+for (subsect in subsects) {
+  
+  #Filtering for subsect and store
+  training_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+  test_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+  
+  #Creating time series object
+  ts_data_train <- ts(training_5751_temp$quantity_sold_imp, frequency = 365, start = c(2021,149),end = c(2022,177))
+  ts_data_test <- ts(test_5751_temp$quantity_sold_imp, frequency = 365, start = c(2022,178), end = c(2022,243))
+  
+  #Fitting arima
+  fit_arima <- auto.arima(ts_data_train,D = 0)
+  
+  #Predicting values
+  predictions <- forecast(fit_arima,h = length(ts_data_test))
+  plot(predictions)
+  
+  #Getting accuracy scores for subsect-packsize
+  subsectAccuacy <- accuracy(predictions, ts_data_test)
+  
+  #Getting error metrics
+  MAE <- subsectAccuacy[6]
+  ME <- subsectAccuacy[2]
+  RMSE <- subsectAccuacy[4]
+  
+  #Appending error metrics to lists
+  RMSEs <- append(RMSEs, RMSE)
+  MAEs <- append(MAEs, MAE)
+  MEs <- append(MEs, ME)
+  
+}
+
+#Creating dataframe for results
+ARIMA_1_results <- data.frame(Subsect = subsects, Method = c("ARIMA - Regular","ARIMA - Regular","ARIMA - Regular","ARIMA - Regular","ARIMA - Regular","ARIMA - Regular"), MAE = MAEs, ME = MEs, RMSE = RMSEs)
+
+#Displaying results
+ARIMA_1_results
+```
+
+# ARIMA - Forced seasonality
+```{r}
+subsects <- c("BAGUETTES_Single_imp", "ISB - WMEAL LOAVES (Single)",
+              "ROLL_Pack_imp", "ROLL_Single_imp", "WHITE_LOAVES_Single_imp", 
+              "WMEAL_LOAVES_Single_imp")
+
+RMSEs <- c()
+MEs <- c()
+MAEs <- c()
+
+#We iterate over each of the subsects
+for (subsect in subsects) {
+  
+  training_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+  test_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+  
+  #Creating time series object
+  ts_data_train <- ts(training_5751_temp$quantity_sold_imp, frequency = 365, start = c(2021,149),end = c(2022,177))
+  ts_data_test <- ts(test_5751_temp$quantity_sold_imp, frequency = 365, start = c(2022,178), end = c(2022,243))
+  
+  #fitting arima model
+  fit_arima <- auto.arima(ts_data_train,D = 1)
+  
+  #Predicting values
+  predictions <- forecast(fit_arima,h = length(ts_data_test))
+  plot(predictions)
+  
+  #Getting accuracy scores for subsect-packsize
+  subsectAccuacy <- accuracy(predictions, ts_data_test)
+
+  #Getting error metrics
+  MAE <- subsectAccuacy[6]
+  ME <- subsectAccuacy[2]
+  RMSE <- subsectAccuacy[4]
+  
+  #Appending error metrics to lists
+  RMSEs <- append(RMSEs, RMSE)
+  MAEs <- append(MAEs, MAE)
+  MEs <- append(MEs, ME)
+  
+}
+
+#Making dataframe
+ARIMA_2_results <- data.frame(Subsect = subsects, Method = c("ARIMA - Forced seasonality","ARIMA - Forced seasonality","ARIMA - Forced seasonality","ARIMA - Forced seasonality","ARIMA - Forced seasonality","ARIMA - Forced seasonality"), MAE = MAEs, ME = MEs, RMSE = RMSEs)
+
+#Displaying results
+ARIMA_2_results
+```
+
+# ARIMAX - Full Explanatory Variable
+```{r}
+
+subsects <- c("BAGUETTES_Single_imp",
+              "ROLL_Pack_imp", "ROLL_Single_imp", "WHITE_LOAVES_Single_imp", 
+              "WMEAL_LOAVES_Single_imp")
+
+#Getting all explanatory variables identified from LASSO
+xregs <- c("Lag1_Quantity", "BH_FLAG", "Lag2_Quantity", "Lag7_Quantity", "SATURDAY", "AUTUMN", "Lead1_BH", "Lead2_BH", "THURSDAY", "TUESDAY", "Lag1_BH", "FRIDAY", "Lag28_Quantity", "SPRING", "Weather_Feels_Like_Bin")
+
+RMSEs <- c()
+MEs <- c()
+MAEs <- c()
+
+for (subsect in subsects) {
+  
+  #filtering training and test splits
+  training_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+  test_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+  
+  #Creating time series object
+  ts_data_train <- ts(training_5751_temp$quantity_sold_imp, frequency = 365, start = c(2021,149))
+  ts_data_test <- ts(test_5751_temp$quantity_sold_imp, frequency = 365, start = c(2022,210), end = c(2022,243))
+  
+  #getting explanatory variables as matrix
+  exog_vars <- as.matrix(training_5751_temp[, c("Lag1_Quantity", "BH_FLAG", "Lag2_Quantity", "Lag7_Quantity", "SATURDAY", "AUTUMN", "Lead1_BH", "Lead2_BH", "THURSDAY", "TUESDAY", "Lag1_BH", "FRIDAY", "Lag28_Quantity", "SPRING", "Weather_Feels_Like_Bin")])
+  
+  #resetting column labels
+  dimnames(exog_vars) <- NULL
+
+  #fitting arimax
+  fit_arimax <- auto.arima(ts_data_train, xreg = exog_vars)
+  
+  #predicting vals
+  predictions <- forecast(fit_arimax,h = length(ts_data_test), xreg = exog_vars)
+  plot(predictions)
+  
+  #getting accuracy metrics
+  subsectAccuacy <- accuracy(predictions, ts_data_test)
+
+  MAE <- subsectAccuacy[6]
+  ME <- subsectAccuacy[2]
+  RMSE <- subsectAccuacy[4]
+  
+  RMSEs <- append(RMSEs, RMSE)
+  MAEs <- append(MAEs, MAE)
+  MEs <- append(MEs, ME)
+  
+}
+
+ARIMAX_results <- data.frame(Subsect = subsects,  Method = c("ARIMAX","ARIMAX","ARIMAX","ARIMAX","ARIMAX"),MAE = MAEs, ME = MEs, RMSE = RMSEs)
+
+ARIMAX_results
+
+```
+
+# Combining Results
+```{r}
+
+ARIMA_Tot <- rbind(ARIMA_1_results,ARIMA_2_results)
+
+ARIMA_Tot <- rbind(ARIMA_Tot,ARIMAX_results)
+
+ARIMA_Tot
+
+```
+
+# ARIMAX - Varying Explanatory Variables
+```{r}
+
+subsects <- c("BAGUETTES_Single_imp",
+              "ROLL_Pack_imp", "ROLL_Single_imp", "WHITE_LOAVES_Single_imp", 
+              "WMEAL_LOAVES_Single_imp")
+
+xregs <- c("Lag1_Quantity", "BH_FLAG", "Lag2_Quantity", "Lag7_Quantity", "SATURDAY", "AUTUMN", "Lead1_BH", "Lead2_BH", "THURSDAY", "TUESDAY", "Lag1_BH", "FRIDAY", "Lag28_Quantity", "SPRING", "Weather_Feels_Like_Bin")
+
+current_xregs <- c()
+RMSEs <- c()
+MEs <- c()
+MAEs <- c()
+NOFs <- c() #number of features
+
+#Same as full explanatory feature arimax code but now we increase the number of explanatory features over each itteration.
+for (reg in xregs){
+  current_xregs <- append(current_xregs,reg)
+  
+  number_of_features <- length(current_xregs)
+  
+  for (subsect in subsects) {
+  
+    training_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+    test_5751_temp <- training_data_final %>% filter(stores == 5751, SubSect_PackSize == subsect)
+    
+    #Creating time series object
+    ts_data_train <- ts(training_5751_temp$quantity_sold_imp, frequency = 365, start = c(2021,149))
+    ts_data_test <- ts(test_5751_temp$quantity_sold_imp, frequency = 365, start = c(2022,210), end = c(2022,243))
+    
+    exog_vars <- as.matrix(training_5751_temp[, current_xregs])
+    
+    dimnames(exog_vars) <- NULL
+  
+    fit_arimax <- auto.arima(ts_data_train, xreg = exog_vars)
+    
+    predictions <- forecast(fit_arimax,h = length(ts_data_test), xreg = exog_vars)
+    plot(predictions)
+    
+    subsectAccuacy <- accuracy(predictions, ts_data_test)
+  
+    MAE <- subsectAccuacy[6]
+    ME <- subsectAccuacy[2]
+    RMSE <- subsectAccuacy[4]
+    
+    NOFs <- append(NOFs,number_of_features)
+    RMSEs <- append(RMSEs, RMSE)
+    MAEs <- append(MAEs, MAE)
+    MEs <- append(MEs, ME)
+    
+  }
+  
+}
+
+ARIMAX_2_results <- data.frame(Subsect = subsects,MAE = MAEs, ME = MEs, RMSE = RMSEs, 'Number of Features' = NOFs)
+
+ARIMAX_2_results
+
+```
+
+
+# ARIMAX - Plotting Results
+```{r}
+
+#plotting RMSE values using ggplot
+ggplot(ARIMAX_2_results, aes(x = `Number.of.Features`,y = `RMSE`,color = factor(Subsect))) + 
+  geom_line() + labs(x = "Number of Covariates",y = "RMSE",color = "Subsect-Package", title = "RMSE against Number of Covariate Features - ARIMAX")+
+  theme(plot.caption = element_text(hjust=0))
+
+ggsave("RMSEs_ARIMAX.png")
+
+```
+
+# Summarising results across all subsects per model
+```{r}
+
+#filtering results for each model
+LASSO_vals <- lasso_es_sma_results %>% filter(Model == "LASSO")
+ES_vals <- lasso_es_sma_results %>% filter(Model == "ES")
+SMA_vals <- lasso_es_sma_results %>% filter(Model == "SMA")
+ARIMAX_4covariates <- ARIMAX_2_results %>% filter(Number.of.Features == 4)
+
+#getting mean for each RMSE and MAE value
+LASSO_RMSE <- mean(LASSO_vals$RMSE)
+LASSO_MAE <- mean(LASSO_vals$MAE)
+ES_RMSE <- mean(ES_vals$RMSE)
+ES_MAE <- mean(ES_vals$MAE)
+SMA_RMSE <- mean(SMA_vals$RMSE)
+SMA_MAE <- mean(SMA_vals$MAE)
+ARIMA1_RMSE <- mean(ARIMA_1_results$RMSE)
+ARIMA1_MAE <- mean(ARIMA_1_results$MAE)
+ARIMA2_RMSE <- mean(ARIMA_2_results$RMSE)
+ARIMA2_MAE <- mean(ARIMA_2_results$MAE)
+ARIMAX_RMSE <- mean(ARIMAX_4covariates$RMSE)
+ARIMAX_MAE <- mean(ARIMAX_4covariates$MAE)
+
+#Printing values
+print("LASSO RMSE")
+LASSO_RMSE 
+print("LASSO MAE")
+LASSO_MAE 
+print("ES RMSE")
+ES_RMSE
+print("ES MAE")
+ES_MAE 
+print("SMA RMSE")
+SMA_RMSE 
+print("SMA MAE")
+SMA_MAE
+print("ARIMA-Standard RMSE")
+ARIMA1_RMSE 
+print("ARIMA-Standard MAE")
+ARIMA1_MAE 
+print("ARIMA-FS RMSE")
+ARIMA2_RMSE 
+print("ARIMA MAE")
+ARIMA2_MAE 
+print("ARIMAX RMSE")
+ARIMAX_RMSE 
+print("ARIMAX MAE")
+ARIMAX_MAE 
+
+```
+
+# Box plots per model for RMSE
+```{r}
+#plotting box plots
+boxplot(LASSO_vals$RMSE, ES_vals$RMSE, SMA_vals$RMSE, ARIMA_1_results$RMSE,ARIMA_2_results$RMSE,
+        names =c("LASSO","ES","SMA","ARIMA","ARIMAX"),
+        xlab = "Model", ylab = "Values")
+
+title(main="Boxplots of RMSE per Model Across all Subsect-Packsizes")
+
+```

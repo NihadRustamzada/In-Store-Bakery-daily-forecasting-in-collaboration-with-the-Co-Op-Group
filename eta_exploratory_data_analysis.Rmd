@@ -1,0 +1,319 @@
+---
+title: "Exploratory Data Analysis"
+author: 'Team ETA'
+date: "2023-11-27"
+output: html_document
+---
+
+# Load Libraries
+```{r, include=F}
+
+library(tidyverse)
+library(lsr)
+library(corrplot)
+library(reshape2)
+
+```
+
+# Load Data
+```{r}
+
+setwd("./data/")
+coop_data <- read.csv("LU Grp project data - Co-op ISB forecasting.csv")
+
+```
+
+# Pre-processing
+```{r}
+
+# Observe the data types
+# str(coop_data)
+
+# Number of the one hot encoded vars have been parsed as int and products are char so we will convert some vars to factors
+
+# Create vector of column to convert to factor
+names <- c('MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY','MIDWEEK','WEEKEND','BH_FLAG','SPRING','SUMMER','AUTUMN','Product_Code','Store_Number','Store_Name','Product_Description','SubSect_Description','OPENING_TIME','CLOSING_TIME')
+
+# Convert cols to factor
+coop_data[,names] <- lapply(coop_data[,names] , factor)
+
+# Convert trans_date to date as currently a char
+coop_data$Transaction_date <- as_date(coop_data$Transaction_date)
+
+```
+
+# In report: Box plot of sales by day of week for a selection of stores, looking at the variance in sales by day at store level
+```{r}
+
+grp_cols = c("Transaction_date","Store_Number")
+store_total_daily_sales <- coop_data %>% 
+  select(Store_Number,Transaction_date,Full_Price_Sales_Quantity,Reduced_To_Clear_Quantity )  %>% 
+  group_by(across(all_of(grp_cols))) %>% 
+  summarise(
+    sales = sum(Full_Price_Sales_Quantity),
+    reduced_sales = sum(Reduced_To_Clear_Quantity))
+
+store_total_daily_sales %>% filter(Store_Number %in% c(5147, 8093, 5751, 8048)) %>%
+
+ggplot( aes(x= reorder(weekdays(Transaction_date,abbreviate= TRUE),wday(Transaction_date)), y = sales)) + geom_boxplot(fill = "#00abff") + 
+  theme_classic()+
+  facet_wrap(~ Store_Number, ncol = 3,scales = "free") +
+  xlab(label = "") +
+  ylab(label = "Quantity Sold") +
+  labs(title = "Boxplot of Quantity of Bread sold per store by Day")
+  
+##############################################################################
+# bar chart of quantity sold by store (top level)
+
+# ggplot(store_total_daily_sales, aes(y = sales, x = reorder(Store_Number,-sales)))+ 
+#   geom_col(fill = "#00abff") + 
+#   theme_classic()+
+#   labs(title = "Quantity of Bread sold per store",caption = "(between May-21 and Aug-22)" )+
+#   xlab(label = "Store Number")+
+#   ylab(label = "Quantity Sold")
+
+```
+
+# In report: Create Boxplot of Quantity of Bread sold by Shop Daily
+```{r, warning=FALSE, message = FALSE}
+
+ stores <- c(5343, 8093,5751,5147#,8051,3446 ,6002,7867,8048
+             )
+# 
+# coop_data %>% 
+#   #filter(Store_Number %in% stores  ) %>% 
+#   group_by(Store_Number,Product_Code) %>% tally() %>% spread(Product_Code,n) 
+
+# making a chart of the table
+
+# p <-coop_data %>% 
+#   filter(Store_Number %in% stores  ) %>% 
+#   group_by(Store_Number,Product_Description) %>% 
+#   tally() %>% 
+#   spread(Product_Description,n) %>%
+#   pivot_longer(!Store_Number,names_to = "Product", values_to = "count") 
+# 
+# # trim some of the product names down a bit as they dont fit on the chart!!
+# p$Product <-gsub("^(Co-op |Co-op Irresistible )", "", p$Product)
+# p$Product <-gsub("^(Extra Mature |Kalamata )", "", p$Product)
+
+
+coop_data$Prod_Desc <-gsub("^(Co-op |Co-op Irresistible )", "", coop_data$Product_Description)
+coop_data$Prod_Desc <-gsub("^(Extra Mature |Kalamata )", "", coop_data$Prod_Desc) 
+
+# store 5147 deepdive
+# product level by day
+grp_prod_cols_seq = c("Store_Number","Prod_Desc",
+                      "Transaction_date")
+
+
+p_1 <-  store_sub_total_daily_sales_by_day <- coop_data %>% 
+  filter(Transaction_date <= as.Date("2021-12-01") |Transaction_date >= as.Date("2021-12-20") ) %>%
+  filter(Prod_Desc %in% c( "Brown Sourdough Bloomer 360G","Tiger Baton PMP 200G","White Scotch Rolls 4S","White Farmhouse Loaf PMP 800G")) %>%
+  #filter(Store_Number == 5147 )
+  select(Store_Number,Prod_Desc,Transaction_date,Full_Price_Sales_Quantity,
+         Reduced_To_Clear_Quantity )  %>% 
+  group_by(across(all_of(grp_prod_cols_seq))) %>% 
+  summarise(
+    sales = sum(Full_Price_Sales_Quantity),
+    reduced_sales = sum(Reduced_To_Clear_Quantity)) %>%
+  mutate( weekday = weekdays(Transaction_date,abbreviate= TRUE)) 
+
+ ggplot(p_1, aes(x= Store_Number
+                   #reorder(weekdays(Transaction_date,abbreviate= TRUE),wday(Transaction_date))
+                   , y = sales)) + geom_boxplot(fill = "#00abff") + 
+  theme_classic()+
+  facet_wrap(~ Prod_Desc, ncol = 2,scales = "free") +
+  xlab(label = "Store") +
+  ylab(label = "Quantity Sold") +
+  labs(title = "Boxplot of Quantity of Bread sold by Shop Daily") +
+   theme(strip.text.x = element_text(size = 5),
+         strip.text.y = element_text(size = 5),
+         axis.text.x = element_text(size = 5),
+         axis.text.y = element_text(size = 5),
+         axis.title.y = element_text(size = 5),
+         axis.title.x = element_text(size = 5)
+         ) 
+ 
+```
+
+# Create weather variables
+```{r}
+
+v_cold <- mean(coop_data$Weather_Feels_Like)-(sd(coop_data$Weather_Feels_Like)*3)
+cold <- mean(coop_data$Weather_Feels_Like)-(sd(coop_data$Weather_Feels_Like)*2)
+cool <- mean(coop_data$Weather_Feels_Like)-(sd(coop_data$Weather_Feels_Like))
+warm <- mean(coop_data$Weather_Feels_Like)+(sd(coop_data$Weather_Feels_Like))
+hot <- mean(coop_data$Weather_Feels_Like)+(sd(coop_data$Weather_Feels_Like)*2)
+v_hot <- mean(coop_data$Weather_Feels_Like)+(sd(coop_data$Weather_Feels_Like)*3)
+
+coop_data$weather_tempband <- ifelse(coop_data$Weather_Feels_Like >= v_hot,"v_hot",
+                                     ifelse(coop_data$Weather_Feels_Like >= hot, "hot",
+                                     ifelse(coop_data$Weather_Feels_Like >= warm, "warm",
+                                     ifelse(coop_data$Weather_Feels_Like >= mean(coop_data$Weather_Feels_Like), "mild_warm",
+                                     ifelse(coop_data$Weather_Feels_Like<= v_cold,"v_cold",
+                                     ifelse(coop_data$Weather_Feels_Like<= cold, "cold",
+                                     ifelse(coop_data$Weather_Feels_Like<= cool, "cool", "mild_cool")))))))
+                                     
+coop_data$weather_tempband <- factor(coop_data$weather_tempband, levels = c("v_cold", "cold", "cool", "mild_cool", "mild_warm", "warm", "hot", "v_hot"))
+
+
+# Perform an ANOVA between weather_tempband and sales
+anova_result <- aov(Full_Price_Sales_Quantity ~ weather_tempband, data = coop_data)
+
+# Print the summary of the ANOVA result
+summary(anova_result)
+
+
+cor.test(coop_data$Weather_Feels_Like, coop_data$Full_Price_Sales_Quantity, method = "pearson")
+
+#Eta-squared is a measure of effect size that quantifies the proportion of variance in a continuous variable that is explained by a 
+#factor variable. It ranges from 0 to 1, where 0 indicates no effect and 1 indicates a large effect
+
+
+# Calculate the eta-squared between weather_tempband and sales
+etaSquared(aov(Full_Price_Sales_Quantity ~ weather_tempband, data = coop_data))
+
+w <- coop_data %>% 
+  group_by(Weather_Feels_Like,Weather_Rain,Weather_Cloud,Transaction_date)%>%
+  summarise(
+    sales = sum(Full_Price_Sales_Quantity)
+  ) %>%
+  group_by(Weather_Feels_Like,Weather_Rain,Weather_Cloud) %>%
+  summarise(
+    avg_sales = sum(sales)/ n_distinct(Transaction_date)
+  )
+
+ggplot(w, aes(x = (Weather_Feels_Like), y = log(avg_sales))) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE)+
+   theme_classic()+
+  xlab(label = "Weather Feels Like") +
+  ylab(label = "Avg Quantity Sold") +
+  labs(title = "Scatterplot of Feels Like Temperature vs Avg Quantity of Bread sold Daily")
+
+#plot(w$Weather_Feels_Like,w$avg_sales)+abline()
+#boxplot(w$Weather_Rain,w$avg_sales)
+
+canonical_result <- cancor(w[,c("avg_sales")], w[,c("Weather_Feels_Like", "Weather_Rain", "Weather_Cloud")])
+
+# Print the summary of the canonical result
+canonical_result
+
+
+regression_result <- lm(avg_sales ~ Weather_Feels_Like + Weather_Rain + Weather_Cloud, data = w)
+
+summary(regression_result)
+
+
+## this isnt a linear regression as it implies sales will increase to infinity with temp increase. realistically if the temp is 100 degress sales will likely be 0 as no one would be able to leave the house. 
+
+#hist(coop_data$Weather_Feels_Like[coop_data$Weather_Feels_Like < cold | coop_data$Weather_Feels_Like > hot])
+
+# p_3a %>% 
+#   #filter(weekday == "Tue") %>% 
+#   #filter(prod_pack == "ISB - BAGUETTES_Single") %>%
+#   #filter(Weather_Rain ==0) %>%
+#   #filter(Weather_Feels_Like > cold ) %>%
+#   ggplot(  aes(x=Transaction_date, y= log(sales), colour = as.factor(Weather_Rain) ))+ 
+#   geom_point()+
+# #geom_line(aes(y =reduced_sales, colour = 'red'))+ 
+#   theme_classic()+ 
+#   #facet_wrap(p_3a$prod_pack) +
+#   labs(y = "Quantity Sold in Store 5147", x = "Date", title = "Daily quantity of In-Store Baked Bread sold", subtitle = "In 12 Co-op Stores in the Lancaster area")
+
+```
+
+# Assess the correlation between weather variables and sales
+```{r}
+
+c <- as.data.frame(cbind(w$Weather_Feels_Like,w$avg_sales,w$Weather_Rain,w$Weather_Cloud))
+colnames(c) <- c("Weather_Feels_like","avg_sales","Rain","Cloud")
+
+v_cold <- mean(w$Weather_Feels_Like)-(sd(w$Weather_Feels_Like)*3)
+cold <- mean(w$Weather_Feels_Like)-(sd(w$Weather_Feels_Like)*2)
+cool <- mean(w$Weather_Feels_Like)-(sd(w$Weather_Feels_Like))
+warm <- mean(w$Weather_Feels_Like)+(sd(w$Weather_Feels_Like))
+hot <- mean(w$Weather_Feels_Like)+(sd(w$Weather_Feels_Like)*2)
+v_hot <- mean(w$Weather_Feels_Like)+(sd(w$Weather_Feels_Like)*3)
+
+c$weather_tempband <- ifelse(w$Weather_Feels_Like >= v_hot,4,
+                                     ifelse(w$Weather_Feels_Like >= hot, 3,
+                                     ifelse(w$Weather_Feels_Like >= warm, 2,
+                                     ifelse(w$Weather_Feels_Like >= mean(coop_data$Weather_Feels_Like), 1,
+                                     ifelse(w$Weather_Feels_Like<= v_cold,-4,
+                                     ifelse(w$Weather_Feels_Like<= cold, -3,
+                                     ifelse(w$Weather_Feels_Like<= cool, -2, -1)))))))
+
+cor(c$avg_sales,c$Weather_Feels_like)
+cor(c$avg_sales,c$weather_tempband)
+cor(c$avg_sales,c$Rain)
+cor(c$avg_sales,c$Cloud)
+
+corr_matrix <-cor(w[1:4])
+
+get_lower_tri<-function(corr_matrix){
+    corr_matrix[upper.tri(corr_matrix)] <- NA
+    return(corr_matrix)
+  }
+  # Get upper triangle of the correlation matrix
+  get_upper_tri <- function(corr_matrix){
+    corr_matrix[lower.tri(corr_matrix)]<- NA
+    return(corr_matrix)
+  }
+
+reorder_corr_matrix <- function(corr_matrix){
+# Use correlation between variables as distance
+dd <- as.dist((1-corr_matrix)/2)
+hc <- hclust(dd)
+corr_matrix <-corr_matrix[hc$order, hc$order]
+}
+
+# Reorder the correlation matrix
+corr_matrix <- reorder_corr_matrix(corr_matrix)
+upper_tri <- get_upper_tri(corr_matrix)
+# Melt the correlation matrix
+melted_cormat <- melt(upper_tri, na.rm = TRUE)
+# Create a ggheatmap
+
+
+ggheatmap <- ggplot(melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+    name="Pearson\nCorrelation") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 6, hjust = 1))+
+ coord_fixed()
+# Print the heatmap
+print(ggheatmap)
+
+```
+
+# Lets look at this store as a histogram to see if it is more evident from that of the distribution. 
+```{r}
+
+# ggplot(p_1, aes( x = sales)) + 
+#   geom_histogram() + 
+#  # facet_wrap(~ SubSect_Description, ncol = 4,scales = "free") 
+#   facet_grid(SubSect_Description~ Transaction_date_day, 
+#                 scales="free", switch = 'x')
+
+```
+
+Some of the distributions look quite right skewed, which is not surprising given the type of data we dealing with. There is no maximum (stock levels aside) to the sales quantity, but you cant sell less than 0
+
+We can try and force the data to follow a more normal distribution by taking the log of sales
+
+```{r}
+# ggplot(p_1, aes( x = (sales))) + 
+#   geom_histogram() + 
+#  # facet_wrap(~ SubSect_Description, ncol = 4,scales = "free") 
+#   facet_grid(SubSect_Description~ Transaction_date_day, 
+#                 scales="free", switch = 'x')
+```
+
+We now have something that appears to approximate to a normal distribution for store 3446 for day and SubSect level sales quantity
+
+This opens us it to being able to use ML that require the data to closely follow a normal distribution
